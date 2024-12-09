@@ -11,6 +11,9 @@ const ROFL_APP_ID: &str = "rofl1qqn9xndja7e2pnxhttktmecvwzz0yqwxsquqyxdf";
 /// Duration between consecutive blockchain event checks in seconds
 const CHECK_INTERVAL_SECS: u64 = 15;
 
+/// Number of blocks to keep in history per chain
+const BLOCK_HISTORY_SIZE: usize = 10;
+
 /// Configuration for supported blockchain networks
 /// Each tuple contains:
 /// - Network name
@@ -20,7 +23,7 @@ const SUPPORTED_CHAINS: &[(&str, &str, &str)] = &[
     (
         "Ethereum",
         "https://ethereum-rpc.publicnode.com",
-        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH CONTRACT ADDRESS
     ),
 ];
 
@@ -56,7 +59,7 @@ fn create_transfer_event() -> Event {
 /// Maintains check intervals and tracking of processed blocks
 struct EventCheckerApp {
     check_interval: Duration,
-    last_processed_blocks: HashMap<String, u64>,
+    processed_blocks: HashMap<String, u64>,
 }
 
 impl EventCheckerApp {
@@ -64,7 +67,7 @@ impl EventCheckerApp {
     fn new() -> Self {
         Self {
             check_interval: Duration::from_secs(CHECK_INTERVAL_SECS),
-            last_processed_blocks: HashMap::new(),
+            processed_blocks: HashMap::new(),
         }
     }
 
@@ -185,7 +188,7 @@ impl EventCheckerApp {
     /// 5. Waits for the configured interval before next check
     async fn monitor_events(&self) -> Result<()> {
         let transfer_event = create_transfer_event();
-        let mut last_blocks = self.last_processed_blocks.clone();
+        let mut processed_blocks = self.processed_blocks.clone();
 
         loop {
             for (chain_name, rpc_url, contract_address) in SUPPORTED_CHAINS {
@@ -200,134 +203,134 @@ impl EventCheckerApp {
                 let latest_block_num = u64::from_str_radix(&latest_block[2..], 16)
                     .map_err(|e| anyhow::anyhow!("Failed to parse block number: {}", e))?;
 
-                let last_block = last_blocks
+                let highest_processed = processed_blocks
                     .entry(chain_name.to_string())
-                    .or_insert(latest_block_num);
+                    .or_insert(latest_block_num.saturating_sub(BLOCK_HISTORY_SIZE as u64));
 
-                if *last_block >= latest_block_num {
-                    continue;
-                }
-
-                let from_block_hex = format!("0x{:x}", *last_block + 1);
-
-                match self
-                    .check_event_on_chain(
+                // Only process if we have new blocks
+                if *highest_processed < latest_block_num {
+                    let start_block = *highest_processed + 1;
+                    
+                    match self.check_event_on_chain(
                         rpc_url,
                         contract_address,
                         &transfer_event,
-                        &from_block_hex,
-                        &latest_block,
-                    )
-                    .await
-                {
-                    Ok(logs) => {
-                        for log in logs {
-                            let mut decoded_log = serde_json::Map::new();
+                        &format!("0x{:x}", start_block),
+                        &format!("0x{:x}", start_block),
+                    ).await {
+                        Ok(logs) => {
+                            for log in logs {
+                                let mut decoded_log = serde_json::Map::new();
 
-                            decoded_log.insert(
-                                "address".to_string(),
-                                json!(log["address"].as_str().unwrap_or("unknown")),
-                            );
-                            decoded_log.insert(
-                                "blockHash".to_string(),
-                                json!(log["blockHash"].as_str().unwrap_or("unknown")),
-                            );
-                            decoded_log.insert(
-                                "transactionHash".to_string(),
-                                json!(log["transactionHash"].as_str().unwrap_or("unknown")),
-                            );
-                            decoded_log.insert(
-                                "transactionIndex".to_string(),
-                                json!(log["transactionIndex"].as_str().unwrap_or("unknown")),
-                            );
-                            decoded_log.insert(
-                                "logIndex".to_string(),
-                                json!(log["logIndex"].as_str().unwrap_or("unknown")),
-                            );
-                            decoded_log.insert(
-                                "removed".to_string(),
-                                json!(log["removed"].as_bool().unwrap_or(false)),
-                            );
+                                decoded_log.insert(
+                                    "address".to_string(),
+                                    json!(log["address"].as_str().unwrap_or("unknown")),
+                                );
+                                decoded_log.insert(
+                                    "blockHash".to_string(),
+                                    json!(log["blockHash"].as_str().unwrap_or("unknown")),
+                                );
+                                decoded_log.insert(
+                                    "transactionHash".to_string(),
+                                    json!(log["transactionHash"].as_str().unwrap_or("unknown")),
+                                );
+                                decoded_log.insert(
+                                    "transactionIndex".to_string(),
+                                    json!(log["transactionIndex"].as_str().unwrap_or("unknown")),
+                                );
+                                decoded_log.insert(
+                                    "logIndex".to_string(),
+                                    json!(log["logIndex"].as_str().unwrap_or("unknown")),
+                                );
+                                decoded_log.insert(
+                                    "removed".to_string(),
+                                    json!(log["removed"].as_bool().unwrap_or(false)),
+                                );
 
-                            if let Some(block_hex) = log["blockNumber"].as_str() {
-                                if let Ok(block_num) = u64::from_str_radix(&block_hex[2..], 16) {
-                                    decoded_log.insert(
-                                        "blockNumber".to_string(),
-                                        json!({
-                                            "hex": block_hex,
-                                            "decimal": block_num
-                                        }),
-                                    );
-                                } else {
-                                    decoded_log.insert("blockNumber".to_string(), json!(block_hex));
-                                }
-                            }
-
-                            if let Some(timestamp_hex) = log["blockTimestamp"].as_str() {
-                                if let Ok(timestamp) = u64::from_str_radix(&timestamp_hex[2..], 16)
-                                {
-                                    decoded_log.insert(
-                                        "blockTimestamp".to_string(),
-                                        json!({
-                                            "hex": timestamp_hex,
-                                            "decimal": timestamp
-                                        }),
-                                    );
-                                } else {
-                                    decoded_log
-                                        .insert("blockTimestamp".to_string(), json!(timestamp_hex));
-                                }
-                            }
-
-                            if let Some(data) = log["data"].as_str() {
-                                if let Ok(data_bytes) = Self::decode_hex(data) {
-                                    if let Ok(decoded) =
-                                        ethabi::decode(&[ParamType::Uint(256)], &data_bytes)
-                                    {
+                                if let Some(block_hex) = log["blockNumber"].as_str() {
+                                    if let Ok(block_num) = u64::from_str_radix(&block_hex[2..], 16) {
                                         decoded_log.insert(
-                                            "data".to_string(),
+                                            "blockNumber".to_string(),
                                             json!({
-                                                "hex": data,
-                                                "decoded": decoded[0].to_string()
+                                                "hex": block_hex,
+                                                "decimal": block_num
                                             }),
                                         );
                                     } else {
+                                        decoded_log.insert("blockNumber".to_string(), json!(block_hex));
+                                    }
+                                }
+
+                                if let Some(timestamp_hex) = log["blockTimestamp"].as_str() {
+                                    if let Ok(timestamp) = u64::from_str_radix(&timestamp_hex[2..], 16)
+                                    {
+                                        decoded_log.insert(
+                                            "blockTimestamp".to_string(),
+                                            json!({
+                                                "hex": timestamp_hex,
+                                                "decimal": timestamp
+                                            }),
+                                        );
+                                    } else {
+                                        decoded_log
+                                            .insert("blockTimestamp".to_string(), json!(timestamp_hex));
+                                    }
+                                }
+
+                                if let Some(data) = log["data"].as_str() {
+                                    if let Ok(data_bytes) = Self::decode_hex(data) {
+                                        if let Ok(decoded) =
+                                            ethabi::decode(&[ParamType::Uint(256)], &data_bytes)
+                                        {
+                                            decoded_log.insert(
+                                                "data".to_string(),
+                                                json!({
+                                                    "hex": data,
+                                                    "decoded": decoded[0].to_string()
+                                                }),
+                                            );
+                                        } else {
+                                            decoded_log.insert("data".to_string(), json!(data));
+                                        }
+                                    } else {
                                         decoded_log.insert("data".to_string(), json!(data));
                                     }
-                                } else {
-                                    decoded_log.insert("data".to_string(), json!(data));
                                 }
-                            }
 
-                            if let Some(topics) = log["topics"].as_array() {
-                                let mut decoded_topics = Vec::new();
-                                for (i, topic) in topics.iter().enumerate() {
-                                    let topic_str = topic.as_str().unwrap_or("unknown");
-                                    match i {
-                                        1 | 2 => {
-                                            let address = if topic_str.len() >= 26 {
-                                                format!("0x{}", &topic_str[26..])
-                                            } else {
-                                                topic_str.to_string()
-                                            };
-                                            decoded_topics.push(json!({
-                                                "hex": topic_str,
-                                                "address": address
-                                            }));
+                                if let Some(topics) = log["topics"].as_array() {
+                                    let mut decoded_topics = Vec::new();
+                                    for (i, topic) in topics.iter().enumerate() {
+                                        let topic_str = topic.as_str().unwrap_or("unknown");
+                                        match i {
+                                            1 | 2 => {
+                                                let address = if topic_str.len() >= 26 {
+                                                    format!("0x{}", &topic_str[26..])
+                                                } else {
+                                                    topic_str.to_string()
+                                                };
+                                                decoded_topics.push(json!({
+                                                    "hex": topic_str,
+                                                    "address": address
+                                                }));
+                                            }
+                                            _ => decoded_topics.push(json!(topic_str)),
                                         }
-                                        _ => decoded_topics.push(json!(topic_str)),
                                     }
+                                    decoded_log.insert("topics".to_string(), json!(decoded_topics));
                                 }
-                                decoded_log.insert("topics".to_string(), json!(decoded_topics));
-                            }
 
-                            println!("{}", serde_json::to_string(&decoded_log).unwrap());
+                                println!("{}", serde_json::to_string(&decoded_log).unwrap());
+                            }
+                            
+                            // Update the highest processed block by one
+                            *highest_processed = start_block;
+                        }
+                        Err(e) => {
+                            println!("Error checking {} chain at block {}: {:?}", chain_name, start_block, e);
+                            // Don't update highest_processed on error, so we'll retry this block
                         }
                     }
-                    Err(e) => println!("Error checking {} chain: {:?}", chain_name, e),
                 }
-
-                *last_block = latest_block_num;
             }
 
             tokio::time::sleep(self.check_interval).await;
